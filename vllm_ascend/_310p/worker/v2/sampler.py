@@ -19,10 +19,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-from vllm_ascend._310p.sample.sampler import (
+from vllm_ascend._310p.worker.v2.sample_utils import (
     _prepare_cpu_generators_310p,
     _random_sample_310p,
 )
+from vllm_ascend.ascend_forward_context import get_mrv2_in_profile_run
+from vllm_ascend.utils import vllm_version_is
 
 _NP_INT64_MIN = np.iinfo(np.int64).min
 _NP_INT64_MAX = np.iinfo(np.int64).max
@@ -106,10 +108,17 @@ class Ascend310PSampler:
     def add_request(
         self,
         req_idx: int,
-        prompt_len: int,
         sampling_params: SamplingParams,
     ) -> None:
-        del prompt_len
+        # vLLM #56497 dropped the prompt_len argument from
+        # Sampler.add_request (and added custom logits processors).
+        self._add_request_impl(req_idx, sampling_params)
+
+    def _add_request_impl(
+        self,
+        req_idx: int,
+        sampling_params: SamplingParams,
+    ) -> None:
         unsupported = []
         if sampling_params.min_p != 0.0:
             unsupported.append("min_p")
@@ -125,7 +134,12 @@ class Ascend310PSampler:
             or getattr(sampling_params, "allowed_token_ids", None)
         ):
             unsupported.append("logits processors")
-        if unsupported:
+        # vLLM main #57926 profiles the sampler with
+        # SamplingParams.for_sampler_warmup(), which enables min_p, penalties,
+        # logprobs and logits processors. 0.32.0 has no such warm-up pass, and
+        # real requests must still fail loudly.
+        in_sampler_warmup = not vllm_version_is("0.32.0") and get_mrv2_in_profile_run()
+        if unsupported and not in_sampler_warmup:
             # TODO: Support penalties / logprobs / min_p in a later 310P MRV2 iteration.
             raise NotImplementedError(
                 f"Unsupported sampling parameters on model runner v2 for 310P: {', '.join(unsupported)}."

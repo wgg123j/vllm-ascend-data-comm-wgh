@@ -2,14 +2,15 @@ import math
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import replace
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 import vllm.config.speculative as speculative_config
 from transformers import DeepseekV2Config, PretrainedConfig
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
 
-from vllm_ascend.utils import is_deepseek_v41
+from vllm_ascend.utils import is_deepseek_v41, is_gqa_pcp_dcp_config, vllm_version_is
 
 _orig_post_init = SpeculativeConfig.__post_init__
 _orig_hf_config_override = SpeculativeConfig.hf_config_override
@@ -82,7 +83,16 @@ def _normalize_kimi_dflash_rope(hf_config: PretrainedConfig) -> None:
     setattr(hf_config, rope_field, {**rope_params, "attention_factor": legacy_attention_factor})
 
 
-def _normalize_legacy_qwen3_dspark_config(hf_config: PretrainedConfig) -> PretrainedConfig:
+def _normalize_legacy_qwen3_dspark_config(
+    hf_config: PretrainedConfig,
+    transformers_mtp_overrides: dict[str, Any] | None = None,
+) -> PretrainedConfig:
+    if not vllm_version_is("0.32.0") and transformers_mtp_overrides is not None:
+        # The Transformers MTP draft is built from the target config: upstream
+        # applies the overrides and none of the checkpoint rewrites below apply.
+        return _orig_hf_config_override(  # type: ignore[call-arg]
+            hf_config, transformers_mtp_overrides
+        )
     hf_config = _orig_hf_config_override(hf_config)
     _normalize_kimi_dflash_rope(hf_config)
     architectures = hf_config.architectures or ()
@@ -205,6 +215,28 @@ def _dspark_post_init(self):
         # gqa backend dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "mask_token_id", None)  # type: ignore
+        _normalize_glm_mla_dspark(self)
+
+
+def _normalize_glm_mla_dspark(self):
+    """Restore MLA architecture erased by the pinned Speculators DSpark converter.
+
+    Remove this narrow compatibility shim when upstream Speculators conversion
+    preserves Glm5DSparkForCausalLM and its MLA architecture metadata.
+    """
+    draft = getattr(self, "draft_model_config", None)
+    config = getattr(draft, "hf_config", None)
+    if draft is None or not isinstance(config, SpeculatorsConfig):
+        return
+    source, _ = SpeculatorsConfig.get_config_dict(draft.model)
+    if "Glm5DSparkForCausalLM" not in (source.get("architectures") or ()):
+        return
+    mla_fields = ("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
+    if any(not isinstance(getattr(config, name, None), int) or getattr(config, name) <= 0 for name in mla_fields):
+        raise ValueError("Glm5DSparkForCausalLM requires dense MLA projection dimensions; cannot use GQA weights.")
+    config.architectures = ["Glm5DSparkForCausalLM"]
+    self.update_arch_()
+    draft.model_arch_config = replace(draft.model_arch_config, is_deepseek_mla=True)
 
 
 SpeculativeConfig.hf_config_override = staticmethod(_normalize_legacy_qwen3_dspark_config)
@@ -225,6 +257,12 @@ _orig_verify_with_parallel_config = ModelConfig.verify_with_parallel_config
 def _ascend_verify_with_parallel_config(self, parallel_config):
     if parallel_config.enable_expert_parallel and not self.is_moe and getattr(self, "runner_type", None) == "draft":
         return
+    # TODO: Remove this guard once upstream GQA/MQA DCP validation supports
+    # PCP-based KV-head replica groups.
+    if is_gqa_pcp_dcp_config(self, parallel_config):
+        guard_parallel_config = copy(parallel_config)
+        guard_parallel_config.decode_context_parallel_size = 1
+        return _orig_verify_with_parallel_config(self, guard_parallel_config)
     return _orig_verify_with_parallel_config(self, parallel_config)
 
 

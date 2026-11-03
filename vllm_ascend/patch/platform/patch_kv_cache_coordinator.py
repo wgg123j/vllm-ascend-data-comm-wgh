@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM projectx
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import sys
 from collections.abc import Mapping
+from copy import copy
+from dataclasses import replace
 from math import lcm
 
 import vllm
+import vllm.envs as envs_vllm
 import vllm.v1.core.kv_cache_coordinator as vllm_kv_cache_coordinator
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -32,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.utils import vllm_version_is
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
@@ -114,6 +118,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         max_in_flight_tokens: int | None = None,
         scheduler_block_size: int | None = None,
         num_prefill_lookahead: int = 0,
+        num_hash_lookahead_tokens: int = 0,
         allow_partial_hash_hits: bool = True,
     ):
         # Keep pcp_world_size in this patched constructor for compatibility
@@ -134,7 +139,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # behavior. The scheduler always supplies the real value at runtime.
         token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens)
         self.max_in_flight_tokens = token_budget
-        self.retention_interval = kv_cache_config.prefix_cache_retention_interval
+        self.retention_interval = getattr(envs_vllm, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
         validate_retention_interval = getattr(
             vllm_kv_cache_coordinator,
             "_validate_prefix_cache_retention_interval",
@@ -146,13 +151,23 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 self.scheduler_block_size,
                 kv_cache_config,
             )
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
-        )
+        if vllm_version_is("0.32.0"):
+            self.block_pool = BlockPool(
+                num_gpu_blocks=kv_cache_config.num_blocks,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
+        else:
+            self.block_pool = BlockPool(
+                num_gpu_blocks=kv_cache_config.num_blocks,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+                num_hash_lookahead_tokens=num_hash_lookahead_tokens,
+            )
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {  # type: ignore[no-redef]
@@ -168,6 +183,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 for i, g in enumerate(kv_cache_config.kv_cache_groups)
                 if isinstance(g.kv_cache_spec, FullAttentionSpec)
             }
+        # vLLM main (#61589) reads this base-class attribute in cache_blocks();
+        # lookahead hashes clear the drop while keeping the groups flagged.
+        if not vllm_version_is("0.32.0"):
+            self.drop_eagle_group_ids = self.eagle_group_ids if use_eagle else set()
 
         extra_mgr_kwargs: dict = {"scheduler_block_size": scheduler_block_size}
         extra_mgr_kwargs["needs_kv_cache_zeroing"] = kv_cache_config.needs_kv_cache_zeroing
@@ -187,9 +206,15 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         )
         # vLLM #53614 aligns exported Mamba checkpoints with EAGLE replay.
         if use_eagle:
-            for manager in self.single_type_managers:
-                if isinstance(manager, MambaManager):
+            for group_id, manager in enumerate(self.single_type_managers):
+                if isinstance(manager, MambaManager) and group_id in self.eagle_group_ids:
                     manager.drop_eagle_checkpoint_block = True
+
+        # Upstream KVCacheCoordinator.__init__ exposes the per-group resolved
+        # block sizes; SimpleCPUOffloadScheduler reads them. This subclass
+        # builds the managers itself instead of calling super().__init__, so
+        # mirror the attribute here.
+        self.group_block_sizes = tuple(manager.block_size for manager in self.single_type_managers)
 
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -505,6 +530,7 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     eagle_attn_layer_names: list[str] | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
     num_prefill_lookahead: int = 0,
+    num_hash_lookahead_tokens: int = 0,
     allow_partial_hash_hits: bool = True,
 ) -> KVCacheCoordinator:
     # Keep pcp_world_size in this patched function for upstream call
@@ -525,6 +551,7 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
         max_in_flight_tokens=token_budget,
         scheduler_block_size=scheduler_block_size,
         num_prefill_lookahead=num_prefill_lookahead,
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
     )
     # vLLM main (#54736) added allow_partial_hash_hits.
     hybrid_kwargs["allow_partial_hash_hits"] = allow_partial_hash_hits
@@ -532,15 +559,25 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     # their independent manager geometry when prefix caching is disabled too.
     num_cacheable_groups = sum(is_prefix_cacheable(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups)
     has_private_groups = 0 < num_cacheable_groups < len(kv_cache_config.kv_cache_groups)
-    if _is_deepseek_v4_kv_cache_config(kv_cache_config) or has_private_groups:
+    if num_cacheable_groups and (_is_deepseek_v4_kv_cache_config(kv_cache_config) or has_private_groups):
         return AscendHybridKVCacheCoordinator(**hybrid_kwargs)  # type: ignore[call-arg]
 
-    if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
+    if num_cacheable_groups == 0 or len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
+        if num_cacheable_groups == 0:
+            # Upstream's no-prefix coordinator expects scheduler specs rather
+            # than the planner's uniform wrappers. Preserve the caller's config.
+            kv_cache_config = copy(kv_cache_config)
+            kv_cache_config.kv_cache_groups = [
+                replace(group, kv_cache_spec=_manager_spec(group.kv_cache_spec))
+                for group in kv_cache_config.kv_cache_groups
+            ]
         orig_kwargs = dict(
             kv_cache_config=kv_cache_config,
             max_model_len=max_model_len,
             use_eagle=use_eagle,
-            enable_caching=enable_caching,
+            # A SWA-only bounded-replay backbone has no persistent KV to hit.
+            # Keep its private managers without constructing a hybrid lookup.
+            enable_caching=enable_caching and num_cacheable_groups > 0,
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
             pcp_world_size=1,
@@ -551,6 +588,10 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
         orig_kwargs["scheduler_block_size"] = scheduler_block_size
         orig_kwargs["num_prefill_lookahead"] = num_prefill_lookahead
         orig_kwargs["allow_partial_hash_hits"] = allow_partial_hash_hits
+        # vLLM main (#61589) added lookahead block hashes; v0.32.0's upstream
+        # coordinator has no such parameter.
+        if not vllm_version_is("0.32.0"):
+            orig_kwargs["num_hash_lookahead_tokens"] = num_hash_lookahead_tokens
         return _orig_get_kv_cache_coordinator(**orig_kwargs)
 
     return AscendHybridKVCacheCoordinator(**hybrid_kwargs)  # type: ignore[call-arg]

@@ -21,6 +21,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,8 @@ import regex as re
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 from vllm.distributed.weight_transfer.base import ParamMeta, WeightSource
+
+from vllm_ascend.utils import vllm_version_is
 
 
 @dataclass(frozen=True)
@@ -267,6 +270,32 @@ def pytest_model_cases() -> list[Any]:
     return [pytest.param(case, id=case.id, marks=pytest.mark.e2e_model(case.model)) for case in MODEL_CASES]
 
 
+# The packed lanes are disabled here because the packed HCCL transfer is flaky: a
+# chunk is received on an NPU stream of its own while the weight loading that reads
+# it is issued on another, and the layerwise reload - which retains a chunk's
+# tensors until a later chunk completes the layer - has no ordering between the
+# two, so the reloaded model can diverge from normal startup loading of the same
+# payload.
+#
+# Every occurrence seen so far is
+# `test_hccl_weight_transfer_transaction[packed-qwen3.5-35b-a3b-moe-layout]` with the
+# *second* live update diverging, while the unpacked lane of the very same case
+# passes in the same job: #18726 (run 38570793020, attempts 1 and 2) and the daily
+# lanes - main@9f9da5562 run 38186343470, main@8194eceae run 38325024027,
+# main@75bfb7622 runs 38657430708 and 38679145716. The failing case's lane is the
+# vLLM *main* pairing on two of those days and the vLLM v0.30.0 pairing on the
+# others, and `vllm_ascend/distributed/weight_transfer/` is byte-identical on `main`
+# and on this branch, so this is not specific to one branch. A fix is proposed in
+# #18763; drop the skip and re-enable the `packed` parametrization once it lands.
+# Until then `main` is likely to need the same skip.
+PACKED_LANE_SKIP_REASON = (
+    "packed weight transfer is flaky: the receive buffer of a chunk is filled and "
+    "loaded on different NPU streams, so the layerwise reload can read tensors "
+    "retained from an earlier chunk without ordering against their allocation "
+    "(#18726; fix proposed in #18763)"
+)
+
+
 _ENGINES_REGISTERED = False
 
 
@@ -299,6 +328,11 @@ def _apply_hf_overrides(config, overrides: dict[str, Any]) -> None:
 
 
 FIXED_WEIGHT_SEED = 20260915
+
+
+def _source_metadata(func):
+    """vLLM main (#63256) requires a cached property; v0.32.0 still calls it."""
+    return func if vllm_version_is("0.32.0") else cached_property(func)
 
 
 class FixedRandomWeightSource(WeightSource):
@@ -404,6 +438,7 @@ class FixedRandomWeightSource(WeightSource):
             return tensor.uniform_(0.9, 1.1)
         return tensor.uniform_(-0.02, 0.02)
 
+    @_source_metadata
     def metadata(self) -> list[ParamMeta]:
         return [ParamMeta(name, dtype, shape) for name, shape, dtype in self._parameters]
 
@@ -411,6 +446,12 @@ class FixedRandomWeightSource(WeightSource):
         with torch.no_grad():
             for name, shape, dtype in self._parameters:
                 yield name, self._make_tensor(name, shape, dtype)
+
+    if not vllm_version_is("0.32.0"):
+
+        def iter_full(self) -> Iterator[tuple[str, torch.Tensor]]:
+            """vLLM main drives updates through `iter_full()` instead of `__iter__`."""
+            yield from self.__iter__()
 
     @property
     def case_id(self) -> str:
@@ -454,7 +495,8 @@ def packed_buffer_size_for(source: FixedRandomWeightSource) -> int:
     raises ``ValueError: Tensor ... exceeds buffer_size_bytes``. Keep the 1 GiB
     floor and add 128 MiB of headroom above the largest tensor.
     """
-    metadata = source.metadata()
+    # `metadata` is a method on v0.32.0 and a cached property on main.
+    metadata = source.metadata() if vllm_version_is("0.32.0") else source.metadata
     max_tensor_bytes = max(math.prod(meta.shape) * meta.dtype.itemsize for meta in metadata)
     return max(max_tensor_bytes + 128 * 2**20, 2**30)
 

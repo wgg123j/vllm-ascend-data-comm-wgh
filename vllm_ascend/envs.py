@@ -29,6 +29,10 @@ from typing import Any
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Startup echo timeout in seconds; cloud endpoints use twice this budget.
+    "VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S", "30")
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
